@@ -48,7 +48,7 @@ def clear_and_update():
     # Добавили headers, чтобы Telegram не принял нас за бота-агрессора
     headers = {'User-Agent': 'Mozilla/5.0'}
     response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, 'html.parser')
+    soup = BeautifulSoup(response.text, 'lxml')
     
     # Собираем тексты
     messages = soup.find_all('div', class_='tgme_widget_message_text')
