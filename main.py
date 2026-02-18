@@ -2,39 +2,35 @@ import os
 import json
 import requests
 from bs4 import BeautifulSoup
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
-# Читаем переменные
+# Переменные окружения
 CHANNEL_NAME = os.getenv("CHANNEL_NAME")
 DOCUMENT_ID = os.getenv("DOCUMENT_ID")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+# Теперь нам нужен только токен доступа (его можно получить через сервис-аккаунт вручную или библиотеку google-auth)
+# Но для максимальной экономии RAM лучше использовать легкую google-auth вместо всего SDK
+from google.oauth2 import service_account
+import google.auth.transport.requests
 
-def get_service():
-    # Проверка: если переменная пустая, выводим понятную ошибку
-    if not GOOGLE_CREDS_JSON:
-        raise ValueError("ОШИБКА: Переменная GOOGLE_APPLICATION_CREDENTIALS_JSON не установлена!")
-    
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+def get_access_token():
+    creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    info = json.loads(creds_json)
     creds = service_account.Credentials.from_service_account_info(
-        creds_dict, scopes=['https://www.googleapis.com/auth/documents'])
-    return build('docs', 'v1', credentials=creds)
+        info, scopes=['https://www.googleapis.com/auth/documents']
+    )
+    auth_req = google.auth.transport.requests.Request()
+    creds.refresh(auth_req)
+    return creds.token
 
 def clear_and_update():
-    if not CHANNEL_NAME or not DOCUMENT_ID:
-        print("ОШИБКА: Не заполнены CHANNEL_NAME или DOCUMENT_ID")
-        return
+    token = get_access_token()
+    headers_auth = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    base_url = f"https://docs.googleapis.com/v1/documents/{DOCUMENT_ID}"
 
-    service = get_service()
-    
-    # 1. Получаем размер документа
-    doc = service.documents().get(documentId=DOCUMENT_ID).execute()
-    content = doc.get('body').get('content')
-    end_index = content[-1].get('endIndex')
-    
+    # 1. Получаем документ (только структуру для endIndex)
+    doc_resp = requests.get(base_url, headers=headers_auth).json()
+    end_index = doc_resp.get('body').get('content')[-1].get('endIndex')
+
     requests_list = []
-    
-    # Удаляем всё, если в документе есть что-то кроме пустой строки
     if end_index > 2:
         requests_list.append({
             'deleteContentRange': {
@@ -42,19 +38,13 @@ def clear_and_update():
             }
         })
 
-    # 2. Парсим Telegram
-    print(f"Загружаю сообщения из t.me/s/{CHANNEL_NAME}...")
+    # 2. Парсинг (используем lxml для экономии памяти)
     url = f"https://t.me/s/{CHANNEL_NAME}"
-    # Добавили headers, чтобы Telegram не принял нас за бота-агрессора
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, 'lxml')
+    response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+    # Указываем 'lxml', он потребляет меньше памяти чем 'html.parser'
+    soup = BeautifulSoup(response.text, 'lxml') 
     
-    # Собираем тексты
     messages = soup.find_all('div', class_='tgme_widget_message_text')
-    
-    # Инвертируем список, если нужно, чтобы новые были внизу, 
-    # или оставляем так, чтобы новые были сверху
     all_text = ""
     for msg in messages:
         text = msg.get_text(separator='\n').strip()
@@ -63,19 +53,18 @@ def clear_and_update():
     if not all_text:
         all_text = "Текстовых сообщений не обнаружено."
 
-    # 3. Вставляем текст
+    # Освобождаем память от тяжелых объектов парсинга явно
+    del soup
+    del response
+
+    # 3. Обновление через прямой POST запрос
     requests_list.append({
-        'insertText': {
-            'location': {'index': 1},
-            'text': all_text
-        }
+        'insertText': {'location': {'index': 1}, 'text': all_text}
     })
 
-    service.documents().batchUpdate(documentId=DOCUMENT_ID, body={'requests': requests_list}).execute()
-    print("Готово! Документ обновлен.")
+    batch_url = f"{base_url}:batchUpdate"
+    requests.post(batch_url, headers=headers_auth, json={'requests': requests_list})
+    print("Документ обновлен и скрипт завершен.")
 
 if __name__ == "__main__":
-    try:
-        clear_and_update()
-    except Exception as e:
-        print(f"Произошла ошибка: {e}")
+    clear_and_update()
